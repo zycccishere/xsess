@@ -38,10 +38,17 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 HOME = Path(os.path.expanduser("~"))
-CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
-CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
-CURSOR_HOME = Path(os.environ.get("CURSOR_HOME") or (HOME / ".cursor"))
-KIMI_HOME = Path(os.environ.get("KIMI_CODE_HOME") or (HOME / ".kimi-code"))
+# resolve(): /root/.codex and /root/.claude are symlinks into /workspace, and
+# different agent processes carry different spellings of CODEX_HOME /
+# CLAUDE_CONFIG_DIR.  Keying files by raw env paths made the same transcript
+# count as two (indexed twice, then purged as "disappeared", flip-flopping on
+# every differently-env'd xsess run) — canonical roots stop that for good.
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR")
+                   or (HOME / ".claude")).resolve()
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (HOME / ".codex")).resolve()
+CURSOR_HOME = Path(os.environ.get("CURSOR_HOME") or (HOME / ".cursor")).resolve()
+KIMI_HOME = Path(os.environ.get("KIMI_CODE_HOME")
+                 or (HOME / ".kimi-code")).resolve()
 DEFAULT_DB = Path(
     os.environ.get("XSESS_DB")
     or (HOME / ".local" / "state" / "session-bridge" / "index.db")
