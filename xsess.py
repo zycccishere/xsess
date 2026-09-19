@@ -842,7 +842,7 @@ def connect(db_path: Path = DEFAULT_DB, create: bool = True) -> sqlite3.Connecti
         db_path.parent.mkdir(parents=True, exist_ok=True)
     elif not db_path.exists():
         raise SystemExit(f"xsess: no index at {db_path} — run `xsess index` first")
-    con = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(str(db_path), timeout=30)
     con.row_factory = sqlite3.Row
     con.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
     if not create:
@@ -1782,6 +1782,27 @@ def _validate_arc(name: str) -> tuple[str, str] | None:
     return None
 
 
+def _merge_host_manifest(host: str, manifest: dict, skipped_refs: set) -> None:
+    """Persist/merge the bundle's session meta for this host (idempotent).
+
+    Called as soon as the manifest is read — before any file is extracted — so
+    an interrupted import still leaves a self-healing state: the next sync
+    indexes whatever did land and tags it @host.
+    """
+    mf = REMOTE_ROOT / host / "manifest.json"
+    merged: dict = {}
+    if mf.exists():
+        try:
+            merged = json.loads(mf.read_text()).get("sessions", {})
+        except Exception:
+            merged = {}
+    merged = {k: v for k, v in merged.items() if k not in skipped_refs}
+    merged.update({k: v for k, v in manifest.get("sessions", {}).items()
+                   if k not in skipped_refs})
+    mf.parent.mkdir(parents=True, exist_ok=True)
+    mf.write_text(json.dumps({"host": host, "sessions": merged}, ensure_ascii=False))
+
+
 def cmd_import(args):
     if args.bundle != "-" and not Path(args.bundle).is_file():
         raise SystemExit(f"xsess: no such bundle: {args.bundle}")
@@ -1804,12 +1825,19 @@ def cmd_import(args):
                     host = args.host or manifest.get("host") or "unknown"
                     for ref, info in manifest.get("sessions", {}).items():
                         row = con.execute(
-                            "SELECT host FROM sessions WHERE ref=?", (ref,)).fetchone()
-                        if row and (row["host"] == "" or row["host"] != host):
-                            # already on this machine (or mirrored under another
-                            # tag): never duplicate a ref across stores
+                            "SELECT host, path FROM sessions WHERE ref=?",
+                            (ref,)).fetchone()
+                        if not row:
+                            continue
+                        already_remote = bool(row["path"]) and str(row["path"]).startswith(
+                            str(REMOTE_ROOT) + os.sep)
+                        if row["host"] != host and not (already_remote and row["host"] == ""):
+                            # exists on this machine for real (local, or mirrored
+                            # under another tag): never duplicate a ref; an
+                            # untagged remote path is a half-done import → update
                             skipped.append((ref, row["host"]))
                             skip_arcs.update(info.get("files", []))
+                    _merge_host_manifest(host, manifest, {r for r, _ in skipped})
                     continue
                 if not member.isfile() or name in skip_arcs:
                     continue
@@ -1826,27 +1854,19 @@ def cmd_import(args):
                 with open(dest, "wb") as fh:
                     shutil.copyfileobj(tf.extractfile(member), fh)
                 extracted += 1
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise SystemExit(
+            f"xsess: bundle stream failed mid-import ({type(exc).__name__}: {exc});"
+            " extracted files stay mirrored and will be indexed by the next sync"
+            " — simply re-run the import to complete it")
     finally:
         if close:
             src.close()
     if not manifest:
         raise SystemExit("xsess: no manifest.json in bundle — not an xsess bundle?")
     assert host is not None
-    skipped_refs = {ref for ref, _ in skipped}
-    mf = REMOTE_ROOT / host / "manifest.json"
-    merged: dict = {}
-    if mf.exists():
-        try:
-            merged = json.loads(mf.read_text()).get("sessions", {})
-        except Exception:
-            merged = {}
-    merged = {k: v for k, v in merged.items() if k not in skipped_refs}
-    merged.update({k: v for k, v in manifest["sessions"].items()
-                   if k not in skipped_refs})
-    mf.parent.mkdir(parents=True, exist_ok=True)
-    mf.write_text(json.dumps({"host": host, "sessions": merged}, ensure_ascii=False))
-    stats = sync(con, quiet=True)
-    fresh = [ref for ref in manifest["sessions"] if ref not in skipped_refs]
+    stats = sync(con)
+    fresh = [ref for ref in manifest["sessions"] if ref not in {r for r, _ in skipped}]
     print(f"xsess: imported {len(fresh)} session(s) as @{host} "
           f"({extracted} file(s), {stats['msgs']} new item(s) indexed)")
     for ref in fresh:
